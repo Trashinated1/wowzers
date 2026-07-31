@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0b0f">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon.svg">
+<title>Wowzers</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div id="app">
+  <!-- Main View -->
+  <div id="mainView" class="view">
+    <header class="topbar">
+      <div class="search-box">
+        <input id="searchInput" placeholder="Search...">
+      </div>
+      <nav class="nav">
+        <button data-tab="search" class="active">Search</button>
+        <button data-tab="charts">Charts</button>
+        <button data-tab="local_fav">Fav</button>
+        <button data-tab="local_pl">Lists</button>
+        <button data-tab="queue">Queue</button>
+        <button data-tab="history">Hist</button>
+      </nav>
+      <div class="topbar-actions">
+        <button id="exportBtn" class="btn-icon" title="Export Data">⬇</button>
+        <button id="importBtn" class="btn-icon" title="Import Data">⬆</button>
+        <input type="file" id="importFile" accept=".json" style="display: none;">
+      </div>
+    </header>
+
+    <main class="content">
+      <h2 id="contentTitle">Search</h2>
+      <div id="content"></div>
+    </main>
+
+    <!-- Player Footer -->
+    <footer class="player">
+      <div id="playerTrackInfo" class="player-track">
+        <img id="playerCover" alt="" src="/icon.svg">
+        <div class="player-meta">
+          <div id="playerTitle" class="player-title">Nothing playing</div>
+          <div id="playerArtist" class="player-artist">—</div>
+        </div>
+      </div>
+      
+      <div class="player-center">
+        <div class="player-controls">
+          <button id="shuffleBtn" class="btn-icon" title="Shuffle">⇄</button>
+          <button id="prevBtn" class="btn-icon" title="Previous">⏮</button>
+          <button id="playBtn" class="btn-play" title="Play">▶</button>
+          <button id="nextBtn" class="btn-icon" title="Next">⏭</button>
+          <button id="repeatBtn" class="btn-icon" title="Repeat">↻</button>
+        </div>
+        <div class="player-progress">
+          <span id="posLabel" class="time-label">0:00</span>
+          <input id="seek" type="range" min="0" max="1000" value="0">
+          <span id="durLabel" class="time-label">0:00</span>
+        </div>
+      </div>
+
+      <div class="player-extras">
+        <button id="lyricsBtn" class="btn-icon" title="Lyrics">♪</button>
+        <button id="eqBtn" class="btn-icon" title="Equalizer">EQ</button>
+        <button id="sleepBtn" class="btn-icon" title="Sleep Timer">☾</button>
+        <input id="volume" type="range" min="0" max="100" value="80" title="Volume">
+      </div>
+    </footer>
+
+    <!-- Added playsinline for iOS background audio support -->
+    <audio id="audio" preload="auto" playsinline></audio>
+
+    <!-- Now Playing Screen -->
+    <div id="nowPlayingScreen" class="now-playing hidden">
+      <div class="np-header">
+        <button id="npClose" class="btn-icon">⌄</button>
+        <span>Now Playing</span>
+        <button class="btn-icon" style="visibility: hidden;">⋯</button>
+      </div>
+      <div class="np-body">
+        <img id="npCover" src="/icon.svg" alt="">
+        <div class="np-meta">
+          <h2 id="npTitle">Nothing playing</h2>
+          <p id="npArtist">—</p>
+        </div>
+        <div class="np-progress">
+          <input id="npSeek" type="range" min="0" max="1000" value="0">
+          <div class="np-time-labels">
+            <span id="npPosLabel">0:00</span>
+            <span id="npDurLabel">0:00</span>
+          </div>
+        </div>
+        <div class="np-controls">
+          <button id="npShuffleBtn" class="btn-icon">⇄</button>
+          <button id="npPrevBtn" class="btn-icon">⏮</button>
+          <button id="npPlayBtn" class="btn-play">▶</button>
+          <button id="npNextBtn" class="btn-icon">⏭</button>
+          <button id="npRepeatBtn" class="btn-icon">↻</button>
+        </div>
+        
+        <div class="np-actions">
+          <button id="npFavBtn" class="np-action-btn" title="Favorite">♡</button>
+          <button id="npPlBtn" class="np-action-btn" title="Add to Playlist">📚</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Overlays -->
+    <div id="overlayContainer">
+      <div id="lyricsPanel" class="overlay hidden">
+        <div class="overlay-head">
+          <h3>Lyrics</h3>
+          <button data-close class="btn-icon">✕</button>
+        </div>
+        <div id="lyricsBody" class="overlay-body"></div>
+      </div>
+
+      <div id="eqPanel" class="overlay hidden">
+        <div class="overlay-head">
+          <h3>Equalizer</h3>
+          <button data-close class="btn-icon">✕</button>
+        </div>
+        <div class="overlay-body eq-body">
+          <label class="toggle">
+            <input type="checkbox" id="eqOn"> 
+            <span>Enabled</span>
+          </label>
+          <select id="eqPreset">
+            <option value="flat">Flat</option>
+            <option value="rock">Rock</option>
+            <option value="pop">Pop</option>
+            <option value="jazz">Jazz</option>
+            <option value="classical">Classical</option>
+            <option value="bass">Bass Boost</option>
+          </select>
+          <p class="hint">EQ is applied client-side via Web Audio API.</p>
+        </div>
+      </div>
+
+      <div id="sleepPanel" class="overlay hidden">
+        <div class="overlay-head">
+          <h3>Sleep Timer</h3>
+          <button data-close class="btn-icon">✕</button>
+        </div>
+        <div class="overlay-body sleep-body">
+          <div class="sleep-presets">
+            <button data-min="5">5m</button>
+            <button data-min="15">15m</button>
+            <button data-min="30">30m</button>
+            <button data-min="45">45m</button>
+            <button data-min="60">60m</button>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="sleepFade"> 
+            <span>Fade out</span>
+          </label>
+          <button id="sleepCancel" class="btn-danger">Cancel Timer</button>
+          <p id="sleepStatus" class="hint"></p>
+        </div>
+      </div>
+
+      <!-- Add to Playlist Modal -->
+      <div id="playlistModal" class="overlay hidden">
+        <div class="overlay-head">
+          <h3>Add to Playlist</h3>
+          <button data-close class="btn-icon">✕</button>
+        </div>
+        <div class="overlay-body">
+          <div class="create-pl">
+            <input type="text" id="newPlName" placeholder="New playlist name...">
+            <button id="createPlBtn" class="btn-primary">Create</button>
+          </div>
+          <div id="localPlList"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

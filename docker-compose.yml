@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  wowzers:
+    build: .
+    ports:
+      - "7654:7654"
+    environment:
+      - DEEZER_ARL=YOUR_ARL_COOKIE_HERE
+      - DEEZER_QUALITY=high # Options: normal (128kbps), high (320kbps), lossless (FLAC)
+    restart: unless-stopped
