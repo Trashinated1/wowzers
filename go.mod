@@ -1,6 +1,6 @@
 module wowzers
 
-go 1.25.12
+go 1.22
 
 require github.com/Cycl0o0/OpenDeezer/v3 v3.0.0
 
