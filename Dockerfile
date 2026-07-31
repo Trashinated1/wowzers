@@ -1,5 +1,5 @@
 # Build stage (Changed to 1.24-alpine to support the go.mod requirement)
-FROM golang:1.24-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
