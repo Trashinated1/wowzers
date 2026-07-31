@@ -1,13 +1,14 @@
-# Build stage
-FROM golang:1.22-alpine AS builder
+# Build stage (Changed to 1.24-alpine to support the go.mod requirement)
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
-# Copy the entire source code first (fixes missing go.sum issues)
-COPY . .
-
-# Download dependencies
+# Copy go.mod and go.sum and download dependencies
+COPY go.mod go.sum ./
 RUN go mod download
+
+# Copy the source code
+COPY . .
 
 # Build the binary
 RUN CGO_ENABLED=0 GOOS=linux go build -o wowzers .
@@ -21,7 +22,7 @@ WORKDIR /app
 COPY --from=builder /app/wowzers .
 
 # Copy the web assets
-COPY --from=builder /app/web ./web
+COPY web ./web
 
 # Expose the port the app runs on
 EXPOSE 7654
