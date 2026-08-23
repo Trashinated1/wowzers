@@ -2,6 +2,8 @@
 
 A free music streaming site that uses the OpenDeezer API.
 
+<img width="603" height="1311" alt="IMG_6321" src="https://github.com/user-attachments/assets/e7930404-07ec-4e44-bb27-b2d98317faeb" />
+<img width="603" height="1311" alt="IMG_6322" src="https://github.com/user-attachments/assets/3ea189e1-8f08-4011-acc9-d16f72985325" />
 
 # Set up deployment (RENDER)
 
