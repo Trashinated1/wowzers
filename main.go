@@ -18,7 +18,7 @@ func main() {
     // Read quality from env, default to high (320kbps)
     quality := os.Getenv("DEEZER_QUALITY")
     if quality == "" {
-        quality = "high"
+        quality = "normal"
     }
 
     srv, err := NewServer(*addr, arl, quality)
