@@ -823,52 +823,6 @@ async function loadAlbum(id) {
     c.appendChild(view);
 }
 
-// loadDeezerPlaylist renders a Deezer (account) playlist with the exact same
-// album-style layout used by loadAlbum: big cover header, Play / Shuffle /
-// ZIP actions and the full multi-artist track list.
-async function loadDeezerPlaylist(id) {
-    const data = await api("/api/playlist/" + encodeURIComponent(id));
-    const tracks = data.tracks || [];
-    document.getElementById("contentTitle").textContent = data.title || "Playlist";
-    const c = document.getElementById("content");
-    c.innerHTML = "";
-
-    const view = document.createElement("div");
-    view.className = "album-view";
-
-    const header = document.createElement("div");
-    header.className = "album-header";
-    header.innerHTML = `
-        <img src="${data.cover || "/icon.svg"}" alt="">
-        <div class="album-meta">
-            <h1>${escapeHtml(data.title || "Playlist")}</h1>
-            <p>Deezer Playlist${data.owner ? " by " + escapeHtml(data.owner) : ""} • ${data.nbTracks || tracks.length} tracks</p>
-            <div class="playlist-actions">
-                <button class="album-play-btn">Play</button>
-                <button class="album-play-btn shuffle-btn">Shuffle</button>
-                <button class="album-play-btn zip-btn" title="Download the playlist as a ZIP of tagged MP3/FLAC files">⬇ ZIP</button>
-            </div>
-        </div>
-    `;
-    if (tracks.length) {
-        header.querySelector(".album-play-btn").onclick = () => playTrackNow(tracks[0], tracks);
-        header.querySelector(".shuffle-btn").onclick = () => {
-            state.shuffle = true;
-            playTrackNow(tracks[0], tracks);
-            setTimeout(() => { state.shuffle = false; updateUI(); }, 1000);
-        };
-    }
-    header.querySelector(".zip-btn").onclick = () => downloadZip("/api/download/playlist/" + encodeURIComponent(id));
-    view.appendChild(header);
-
-    const list = document.createElement("div");
-    list.className = "list";
-    tracks.forEach(t => list.appendChild(trackRow(t, tracks)));
-    view.appendChild(list);
-
-    c.appendChild(view);
-}
-
 // ---------- Local Favorites & Playlists UI ----------
 function loadLocalFavs() {
     const tracks = getLocalFavs();
@@ -883,7 +837,7 @@ function loadLocalFavs() {
     c.appendChild(list);
 }
 
-async function loadLocalPlaylists() {
+function loadLocalPlaylists() {
     const pls = getLocalPlaylists();
     const c = document.getElementById("content"); c.innerHTML = "";
     document.getElementById("contentTitle").textContent = "Playlists";
@@ -901,24 +855,6 @@ async function loadLocalPlaylists() {
         });
         c.appendChild(grid);
     }
-
-    // Deezer account playlists (CSV imports, followed playlists, ...).
-    try {
-        const dzPls = await api("/api/playlists");
-        if (Array.isArray(dzPls) && dzPls.length) {
-            const sec = document.createElement("div"); sec.className = "section-gap";
-            sec.innerHTML = `<h3 style="margin-bottom:16px;">Deezer playlists</h3>`;
-            const grid = document.createElement("div"); grid.className = "grid";
-            dzPls.forEach(p => {
-                const el = document.createElement("div"); el.className = "card";
-                el.innerHTML = `<img src="${p.cover || "/icon.svg"}" alt=""><div class="title">${escapeHtml(p.title)}</div><div class="subtitle">${p.nbTracks || 0} tracks</div>`;
-                el.onclick = () => loadDeezerPlaylist(p.id);
-                grid.appendChild(el);
-            });
-            sec.appendChild(grid);
-            c.appendChild(sec);
-        }
-    } catch (e) { /* account playlists unavailable — local section still works */ }
 
     // CSV import entry point.
     const csvSec = document.createElement("div"); csvSec.className = "section-gap";
