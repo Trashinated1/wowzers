@@ -1,5 +1,5 @@
-// Bumped cache version to v2 to force refresh of old CSS/JS files
-const CACHE = "wowzers-v2";
+// Bumped cache version to v5: gapless preload, punctuation-insensitive CSV matching
+const CACHE = "wowzers-v5";
 const ASSETS = ["/", "/index.html", "/styles.css", "/app.js", "/manifest.json", "/icon.svg"];
 
 self.addEventListener("install", (e) => {
