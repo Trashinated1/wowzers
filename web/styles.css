@@ -18,10 +18,19 @@ html, body {
   color: var(--fg);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   overflow: hidden;
+  -webkit-user-select: none;
   user-select: none;
 }
 #app { height: 100%; width: 100%; }
 .hidden { display: none !important; }
+/* Rendered but invisible: iOS Safari refuses to open the picker when .click()
+   is called on a display:none file input, so keep it in the layout instead. */
+.visually-hidden {
+  position: absolute !important;
+  width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+  opacity: 0;
+}
 .view { height: 100%; width: 100%; display: flex; flex-direction: column; }
 button { cursor: pointer; border: none; background: none; color: inherit; font-family: inherit; }
 input, select { font-family: inherit; outline: none; }
@@ -85,7 +94,7 @@ input, select { font-family: inherit; outline: none; }
 .sub-nav { 
   display: flex; gap: 16px; margin: -24px -16px 24px -16px; 
   padding: 0 16px; background: var(--bg); 
-  border-bottom: 1px solid var(--bg-3); position: sticky; top: 0; z-index: 10; 
+  border-bottom: 1px solid var(--bg-3); position: -webkit-sticky; position: sticky; top: 0; z-index: 10; 
 }
 .sub-nav button { 
   background: transparent; color: var(--muted); padding: 16px 8px; 
@@ -96,14 +105,14 @@ input, select { font-family: inherit; outline: none; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 24px; padding-bottom: 32px; width: 100%; }
 .card { background: var(--bg-2); padding: 16px; border-radius: 8px; cursor: pointer; transition: background 0.2s; }
 .card:hover { background: var(--bg-3); }
-.card img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px; margin-bottom: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+.card img { width: 100%; height: auto; aspect-ratio: 1; object-fit: cover; border-radius: 6px; margin-bottom: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
 .card .title { font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card .subtitle { font-size: 13px; color: var(--muted); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 .section-gap { margin-top: 40px; }
 
 .list { display: flex; flex-direction: column; gap: 4px; width: 100%; }
-.list-row { display: grid; grid-template-columns: 48px 1fr auto auto auto; gap: 12px; padding: 8px; border-radius: 6px; align-items: center; cursor: pointer; }
+.list-row { display: grid; grid-template-columns: 48px 1fr auto auto auto auto; gap: 12px; padding: 8px; border-radius: 6px; align-items: center; cursor: pointer; }
 .list-row:hover { background: var(--bg-2); }
 .list-row img { width: 48px; height: 48px; border-radius: 4px; object-fit: cover; }
 .list-row .info { overflow: hidden; }
@@ -302,3 +311,15 @@ input[type=range]::-moz-range-thumb { width: 12px; height: 12px; background: var
   }
   .album-header { flex-direction: column; align-items: center; text-align: center; }
 }
+/* ---------- Batch ZIP downloads & CSV import ---------- */
+.playlist-actions .zip-btn,
+.playlist-actions .pl-btn { background: var(--bg-3); color: var(--fg); font-size: 14px; }
+.playlist-actions .zip-btn:hover,
+.playlist-actions .pl-btn:hover { background: var(--bg-2); }
+.csv-btn { width: auto; padding: 0 10px; font-size: 11px; font-weight: 700; }
+.import-report h4 { margin: 18px 0 8px; font-size: 14px; }
+.import-report .report-pl { padding: 8px 0; font-size: 14px; border-bottom: 1px solid var(--bg-3); }
+.import-report .report-pl a { color: var(--accent); }
+.import-report .report-skip { padding: 6px 0; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--bg-3); line-height: 1.5; }
+.import-report .report-skip .r-title { color: var(--fg); }
+.import-report .report-skip em { color: var(--muted); }
