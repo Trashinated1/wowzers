@@ -448,6 +448,18 @@ bindTransport("npPlayBtn", playPause);
 bindTransport("npNextBtn", next);
 bindTransport("npPrevBtn", prev);
 
+// ---------- Downloads ----------
+function downloadTrack(t) {
+    if (!t || !t.id) return;
+    const a = document.createElement("a");
+    a.href = "/api/download/" + encodeURIComponent(t.id);
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+}
+document.getElementById("npDownBtn").onclick = () => downloadTrack(state.track);
+
 document.getElementById("shuffleBtn").onclick = () => { state.shuffle = !state.shuffle; updateUI(); };
 document.getElementById("repeatBtn").onclick = () => {
     if (state.repeat === "off") state.repeat = "all";
@@ -473,24 +485,30 @@ function bindSeek(elId, posId) {
     const el = document.getElementById(elId);
     if (!el) return;
     
-    el.addEventListener('pointerdown', () => seekDragging = true);
-    
-    el.addEventListener('input', () => {
+    // iOS 12 has no Pointer Events — use touch + mouse instead.
+    function startDrag() { seekDragging = true; }
+    function moveLabel() {
         document.getElementById(posId).textContent = fmt(parseInt(el.value));
-    });
-    
-    el.addEventListener('pointerup', () => {
+    }
+    function endDrag() {
         if (seekDragging) {
             audio.currentTime = parseInt(el.value) / 1000;
             setTimeout(() => seekDragging = false, 500);
         }
-    });
+    }
+    
+    el.addEventListener('touchstart', startDrag, { passive: true });
+    el.addEventListener('mousedown', startDrag);
+    el.addEventListener('input', moveLabel);
+    el.addEventListener('touchend', endDrag);
+    el.addEventListener('mouseup', endDrag);
 }
 
-window.addEventListener('pointerup', () => {
-    if (seekDragging) {
-        setTimeout(() => seekDragging = false, 500);
-    }
+window.addEventListener('mouseup', () => {
+    if (seekDragging) setTimeout(() => seekDragging = false, 500);
+});
+window.addEventListener('touchend', () => {
+    if (seekDragging) setTimeout(() => seekDragging = false, 500);
 });
 
 bindSeek("seek", "posLabel");
@@ -550,8 +568,8 @@ function renderSearch(res) {
     subNav.className = "sub-nav";
     subNav.innerHTML = `
         <button data-sub="tracks" class="active">Tracks</button>
-        <button data-sub="albums">Albums (NOT WORKING)</button>
-        <button data-sub="artists">Artists (NOT WORKING)</button>
+        <button data-sub="albums">Albums</button>
+        <button data-sub="artists">Artists</button>
     `;
     c.appendChild(subNav);
     
@@ -603,7 +621,10 @@ function trackRow(t, queueContext, queueIdx) {
         <div class="info"><div class="t">${escapeHtml(t.title)}</div><div class="s">${escapeHtml(t.artist)}</div></div>
         <button class="action-btn fav-btn ${isFav ? 'active' : ''}" title="Favorite">${isFav ? '♥' : '♡'}</button>
         <button class="action-btn add-pl-btn" title="Add to Playlist">📚</button>
+        <a class="action-btn dl-btn" href="/api/download/${encodeURIComponent(t.id)}" download title="Download (MP3/FLAC)">⬇</a>
         <div class="dur">${fmt(t.durationMs)}</div>`;
+
+    el.querySelector(".dl-btn").addEventListener("click", (e) => e.stopPropagation());
         
     el.querySelector(".fav-btn").onclick = (e) => {
         e.stopPropagation();
@@ -689,7 +710,7 @@ async function loadAlbum(id) {
         <img src="${data.cover || "/icon.svg"}" alt="">
         <div class="album-meta">
             <h1>${escapeHtml(data.title)}</h1>
-            <p>${escapeHtml(data.artist)} • ${data.nbTracks || (data.tracks || []).length} tracks</p>
+            <p>${escapeHtml(data.artist)}${data.year ? " • " + escapeHtml(data.year) : ""} • ${data.nbTracks || (data.tracks || []).length} tracks</p>
             <button class="album-play-btn">Play Album</button>
         </div>
     `;
@@ -732,7 +753,7 @@ function loadLocalPlaylists() {
     Object.keys(pls).forEach(name => {
         const el = document.createElement("div"); el.className = "card";
         const firstTrack = pls[name][0];
-        el.innerHTML = `<img src="${firstTrack?.cover || "/icon.svg"}" alt=""><div class="title">${escapeHtml(name)}</div><div class="subtitle">${pls[name].length} tracks</div>`;
+        el.innerHTML = `<img src="${(firstTrack && firstTrack.cover) || "/icon.svg"}" alt=""><div class="title">${escapeHtml(name)}</div><div class="subtitle">${pls[name].length} tracks</div>`;
         el.onclick = () => loadLocalPlaylist(name);
         grid.appendChild(el);
     });
@@ -751,7 +772,7 @@ async function loadLocalPlaylist(name) {
     const header = document.createElement("div");
     header.className = "album-header";
     header.innerHTML = `
-        <img src="${tracks[0]?.cover || "/icon.svg"}" alt="">
+        <img src="${(tracks[0] && tracks[0].cover) || "/icon.svg"}" alt="">
         <div class="album-meta">
             <h1>${escapeHtml(name)}</h1>
             <p>Local Playlist • ${tracks.length} tracks</p>
