@@ -26,9 +26,11 @@
         <button data-tab="history">Hist</button>
       </nav>
       <div class="topbar-actions">
+        <button id="csvImportBtn" class="btn-icon csv-btn" title="Import TuneMyMusic CSV">CSV</button>
         <button id="exportBtn" class="btn-icon" title="Export Data">⬇</button>
         <button id="importBtn" class="btn-icon" title="Import Data">⬆</button>
-        <input type="file" id="importFile" accept=".json" style="display: none;">
+        <input type="file" id="importFile" accept=".json" class="visually-hidden">
+        <input type="file" id="csvFile" accept=".csv,text/csv" class="visually-hidden">
       </div>
     </header>
 
@@ -166,7 +168,7 @@
       <!-- Add to Playlist Modal -->
       <div id="playlistModal" class="overlay hidden">
         <div class="overlay-head">
-          <h3>Add to Playlist</h3>
+          <h3 id="playlistModalTitle">Add to Playlist</h3>
           <button data-close class="btn-icon">✕</button>
         </div>
         <div class="overlay-body">
@@ -176,6 +178,15 @@
           </div>
           <div id="localPlList"></div>
         </div>
+      </div>
+
+      <!-- CSV Import Report Modal -->
+      <div id="importReportModal" class="overlay hidden">
+        <div class="overlay-head">
+          <h3 id="importReportTitle">Import</h3>
+          <button data-close class="btn-icon">✕</button>
+        </div>
+        <div id="importReportBody" class="overlay-body import-report"></div>
       </div>
     </div>
   </div>
