@@ -1,19 +1,26 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/bogem/id3v2/v2"
 	"github.com/go-flac/flacpicture"
@@ -70,7 +77,9 @@ type LyricLine struct {
 // with no artist at all). These DTOs hit the same public REST endpoints
 // directly and keep the complete contributor list.
 
-const dzRestBase = "https://api.deezer.com"
+// dzRestBase is a variable so tests can point it at a mock server.
+var dzRestBase = "https://api.deezer.com"
+
 const dzUserAgent = "Mozilla/5.0 OpenDeezer/0.1"
 
 var dzHTTP = &http.Client{Timeout: 30 * time.Second}
@@ -131,6 +140,24 @@ type dzRestArtistFull struct {
 	NbAlbum       int         `json:"nb_album"`
 }
 
+// dzRestPlaylistFull is /playlist/{id} — full multi-artist track listing plus
+// owner and covers, used for the album-style playlist view and zip downloads.
+type dzRestPlaylistFull struct {
+	ID    json.Number `json:"id"`
+	Title string      `json:"title"`
+	Owner struct {
+		Name string `json:"name"`
+	} `json:"user"`
+	Public        bool   `json:"public"`
+	NbTracks      int    `json:"nb_tracks"`
+	PictureXL     string `json:"picture_xl"`
+	PictureBig    string `json:"picture_big"`
+	PictureMedium string `json:"picture_medium"`
+	Tracks        struct {
+		Data []dzRestTrack `json:"data"`
+	} `json:"tracks"`
+}
+
 // joinArtists returns the full multi-artist line plus the primary artist ID.
 // Deezer's `contributors` array lists every credited artist in order (primary
 // first). When the array is missing or empty, the primary `artist` object is
@@ -170,6 +197,16 @@ func pickCover(a dzRestAlbum) string {
 		return a.CoverBig
 	}
 	return a.CoverMedium
+}
+
+func pickPicture(xl, big, medium string) string {
+	if xl != "" {
+		return xl
+	}
+	if big != "" {
+		return big
+	}
+	return medium
 }
 
 func trackFromRest(r dzRestTrack) Track {
@@ -218,6 +255,11 @@ func NewServer(addr, arl, quality string) (*Server, error) {
 }
 
 func (s *Server) Run() error {
+	return http.ListenAndServe(s.addr, s.withCORS(s.routes()))
+}
+
+// routes builds the HTTP handler: static web assets plus the JSON API.
+func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.Handle("GET /", http.FileServer(http.FS(webRoot)))
@@ -231,9 +273,13 @@ func (s *Server) Run() error {
 	mux.HandleFunc("GET /api/album/{id}", s.handleAlbum)
 	mux.HandleFunc("GET /api/lyrics/{id}", s.handleLyrics)
 	mux.HandleFunc("GET /api/stream/{id}", s.handleStream)
+	mux.HandleFunc("GET /api/cover/{id}", s.handleCover)
 	mux.HandleFunc("GET /api/download/{id}", s.handleDownload)
-
-	return http.ListenAndServe(s.addr, s.withCORS(mux))
+	mux.HandleFunc("GET /api/download/album/{id}", s.handleAlbumDownload)
+	mux.HandleFunc("GET /api/download/playlist/{id}", s.handlePlaylistDownload)
+	mux.HandleFunc("GET /api/download/zip", s.handleZipDownload)
+	mux.HandleFunc("POST /api/import/csv", s.handleImportCSV)
+	return mux
 }
 
 func (s *Server) withCORS(h http.Handler) http.Handler {
@@ -655,6 +701,41 @@ func (s *Server) handlePlaylist(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := r.PathValue("id")
+
+	// Full REST listing first: real playlist title, owner and cover plus
+	// the complete contributor list per track, so the playlist view gets
+	// the same rich header the album view has.
+	if b, err := restGet("/playlist/" + url.PathEscape(id)); err == nil {
+		var pl dzRestPlaylistFull
+		if json.Unmarshal(b, &pl) == nil && len(pl.Tracks.Data) > 0 {
+			ts := make([]Track, 0, len(pl.Tracks.Data))
+			for _, t := range pl.Tracks.Data {
+				ts = append(ts, trackFromRest(t))
+			}
+			nb := pl.NbTracks
+			if nb == 0 {
+				nb = len(ts)
+			}
+			title := strings.TrimSpace(pl.Title)
+			if title == "" {
+				title = "Playlist"
+			}
+			writeJSON(w, map[string]any{
+				"title":    title,
+				"owner":    pl.Owner.Name,
+				"cover":    pickPicture(pl.PictureXL, pl.PictureBig, pl.PictureMedium),
+				"tracks":   ts,
+				"nbTracks": nb,
+			})
+			return
+		}
+	}
+
+	// SDK fallback (private playlists are not in the public REST API).
+	if s.client == nil {
+		http.Error(w, "playlist unavailable", 502)
+		return
+	}
 	pl, err := s.client.PlaylistTracks(id)
 	if err != nil {
 		http.Error(w, err.Error(), 502)
@@ -700,26 +781,45 @@ func (s *Server) handleLyrics(w http.ResponseWriter, r *http.Request) {
 
 // ---------- handlers: stream + download ----------
 
-func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
+// prepareTrack resolves a StreamPlan at the current quality, falling back to
+// 128kbps once if the preferred quality is rejected. Only the prepare step
+// (and our fallback policy) is serialized behind s.mu; the SDK client is
+// internally synchronized, so downloads can run concurrently afterwards.
+func (s *Server) prepareTrack(id string) (*dz.StreamPlan, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	id := r.PathValue("id")
-
 	plan, err := s.client.PrepareStream(id)
 	if err != nil {
 		// FALLBACK: retry at 128kbps if the preferred quality fails.
 		log.Printf("stream %s: prepare failed — falling back to 128kbps", id)
 		s.client.SetQuality(dz.QualityNormal)
 		plan, err = s.client.PrepareStream(id)
-		if err != nil {
-			http.Error(w, err.Error(), 502)
-			return
-		}
+	}
+	return plan, err
+}
+
+// fetchAudio downloads a plan's decrypted audio into memory.
+func fetchAudio(plan *dz.StreamPlan, id string) ([]byte, error) {
+	buf := new(bytes.Buffer)
+	if err := dz.DownloadTrack(plan, buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	plan, err := s.prepareTrack(id)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
 	}
 
 	// Download into memory to support Range requests (fixes broken pipes).
-	buf := new(bytes.Buffer)
-	if err := dz.DownloadTrack(plan, buf); err != nil {
+	// Runs WITHOUT s.mu so playback stays responsive during zip downloads.
+	audio, err := fetchAudio(plan, id)
+	if err != nil {
 		log.Printf("stream %s: %v", id, err)
 		http.Error(w, "Failed to download track", 500)
 		return
@@ -734,19 +834,32 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	http.ServeContent(w, r, "", time.Now(), bytes.NewReader(buf.Bytes()))
+	http.ServeContent(w, r, "", time.Now(), bytes.NewReader(audio))
 }
 
-// handleDownload streams the track as a tagged MP3/FLAC file with the cover
-// art and full metadata (title, every credited artist, album, year, track
-// number) embedded, ready to be saved straight into a music library.
-func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := r.PathValue("id")
+// errTrackNotFound means neither the REST metadata nor the SDK had the track.
+var errTrackNotFound = errors.New("track not found")
 
-	// 1. Full metadata via public REST /track/{id} (includes contributors,
-	//    track_position, release_date and the album's cover_xl).
+// trackFile is a fully assembled, tagged audio download.
+type trackFile struct {
+	Data   []byte // tagged audio bytes (MP3 with ID3v2, FLAC with Vorbis+Picture)
+	Ext    string // ".mp3" or ".flac" — follows the format Deezer delivered
+	Title  string
+	Artist string
+	Album  string
+}
+
+// buildTrackFile assembles one downloadable track:
+//  1. metadata via public REST /track/{id} (contributors, track_position,
+//     release_date, album cover) with an SDK fallback;
+//  2. audio bytes via the OpenDeezer SDK grabber (the same PrepareStream +
+//     DownloadTrack pipeline used for playback — never re-encoded);
+//  3. cover art via the CDN (memory-cached, best-effort);
+//  4. metadata embedded on top of the untouched audio.
+func (s *Server) buildTrackFile(id string) (trackFile, error) {
+	tf := trackFile{}
+
+	// 1. Metadata.
 	title, artist, album, year := "", "", "", ""
 	trackNum := 0
 	coverURL := ""
@@ -773,8 +886,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if title == "" {
-		http.Error(w, "track not found", 404)
-		return
+		return tf, errTrackNotFound
 	}
 	if artist == "" {
 		artist = "Unknown Artist"
@@ -782,74 +894,818 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if album == "" {
 		album = "Unknown Album"
 	}
+	tf.Title, tf.Artist, tf.Album = title, artist, album
 
 	// 2. Audio bytes via the SDK (auth + decryption), with 128kbps fallback.
-	plan, err := s.client.PrepareStream(id)
+	plan, err := s.prepareTrack(id)
 	if err != nil {
-		s.client.SetQuality(dz.QualityNormal)
-		plan, err = s.client.PrepareStream(id)
-		if err != nil {
-			http.Error(w, err.Error(), 502)
-			return
-		}
+		return tf, err
 	}
-	audio := new(bytes.Buffer)
-	if err := dz.DownloadTrack(plan, audio); err != nil {
-		log.Printf("download %s: %v", id, err)
-		s.client.SetQuality(dz.QualityNormal)
-		plan, err = s.client.PrepareStream(id)
+	audio, aerr := fetchAudio(plan, id)
+	if aerr != nil {
+		log.Printf("download %s: %v", id, aerr)
+		plan, err = s.prepareTrack(id) // prepareTrack downgrades to 128 on failure
 		if err != nil {
-			http.Error(w, err.Error(), 502)
-			return
+			return tf, err
 		}
-		audio = new(bytes.Buffer)
-		if err := dz.DownloadTrack(plan, audio); err != nil {
-			http.Error(w, "download failed", 500)
-			return
+		if audio, aerr = fetchAudio(plan, id); aerr != nil {
+			return tf, aerr
 		}
 	}
 
 	// 3. Cover art (best-effort — a missing image never fails the download).
 	var art []byte
 	if coverURL != "" {
-		if ab, aerr := fetchArtwork(coverURL); aerr == nil && len(ab) > 0 {
-			art = ab
-		} else if aerr != nil {
-			log.Printf("download %s: artwork fetch failed (non-fatal): %v", id, aerr)
+		art = fetchArtworkCached(coverURL)
+		if len(art) == 0 {
+			log.Printf("download %s: artwork fetch failed (non-fatal)", id)
 		}
 	}
 
 	// 4. Tag with metadata. On any tagging error the raw audio bytes are
 	//    served untouched rather than a corrupted file.
 	isFLAC := strings.Contains(strings.ToUpper(plan.Format), "FLAC")
-	ext := ".mp3"
+	tf.Ext = ".mp3"
 	var final []byte
 	var tagErr error
 	if isFLAC {
-		ext = ".flac"
-		final, tagErr = tagFLACBytes(audio.Bytes(), title, artist, album, year, trackNum, art)
+		tf.Ext = ".flac"
+		final, tagErr = tagFLACBytes(audio, title, artist, album, year, trackNum, art)
 	} else {
-		final, tagErr = tagMP3Bytes(audio.Bytes(), title, artist, album, year, trackNum, art)
+		final, tagErr = tagMP3Bytes(audio, title, artist, album, year, trackNum, art)
 	}
 	if tagErr != nil {
 		log.Printf("download %s: tagging failed (serving raw audio): %v", id, tagErr)
-		final = audio.Bytes()
+		final = audio
 	}
+	tf.Data = final
+	return tf, nil
+}
 
-	// 5. Serve as an attachment with a descriptive filename.
-	fname := sanitizeFilename(artist+" - "+title) + ext
+// contentDisposition builds an RFC 5987 attachment header for a filename.
+func contentDisposition(fname string) string {
 	asciiName := strings.Map(func(r rune) rune {
 		if r < 32 || r > 126 {
 			return '_'
 		}
 		return r
 	}, fname)
+	return `attachment; filename="` + asciiName + `"; filename*=UTF-8''` + url.PathEscape(fname)
+}
 
-	w.Header().Set("Content-Type", contentTypeFor(ext))
-	w.Header().Set("Content-Disposition",
-		`attachment; filename="`+asciiName+`"; filename*=UTF-8''`+url.PathEscape(fname))
-	w.Header().Set("Content-Length", strconv.Itoa(len(final)))
-	w.Write(final)
+// handleDownload serves a single tagged MP3/FLAC file with the cover art and
+// full metadata (title, every credited artist, album, year, track number)
+// embedded, ready to be saved straight into a music library.
+func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
+	tf, err := s.buildTrackFile(r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, errTrackNotFound) {
+			http.Error(w, "track not found", 404)
+			return
+		}
+		http.Error(w, err.Error(), 502)
+		return
+	}
+
+	fname := sanitizeFilename(tf.Artist+" - "+tf.Title) + tf.Ext
+	w.Header().Set("Content-Type", contentTypeFor(tf.Ext))
+	w.Header().Set("Content-Disposition", contentDisposition(fname))
+	w.Header().Set("Content-Length", strconv.Itoa(len(tf.Data)))
+	w.Write(tf.Data)
+}
+
+// ---------- zip downloads (albums, playlists, arbitrary id lists) ----------
+
+// maxZipTracks caps one archive so a request can't pin the server forever.
+const maxZipTracks = 300
+
+// writeZipEntry appends a stored (uncompressed — MP3/FLAC are already
+// compressed) zip entry named "NNN - Artist - Title.ext", de-duplicated.
+func writeZipEntry(zw *zip.Writer, pos int, tf trackFile, used map[string]int) error {
+	base := fmt.Sprintf("%03d - %s - %s", pos, tf.Artist, tf.Title) + tf.Ext
+	name := sanitizeFilename(base)
+	if n := used[name]; n > 0 {
+		name = sanitizeFilename(fmt.Sprintf("%03d - %s - %s (%d)", pos, tf.Artist, tf.Title, n+1)) + tf.Ext
+	}
+	used[name]++
+	h := &zip.FileHeader{Name: name, Method: zip.Store, Modified: time.Now()}
+	fw, err := zw.CreateHeader(h)
+	if err != nil {
+		return err
+	}
+	_, err = fw.Write(tf.Data)
+	return err
+}
+
+// serveZip streams ids as one ZIP archive of tagged audio files. The first
+// track is fully resolved before any headers are written, so an account or
+// network problem yields a clean 502 instead of a broken archive; later
+// failures skip their track and keep the rest of the archive intact.
+func (s *Server) serveZip(w http.ResponseWriter, ids []string, zipName string) {
+	if len(ids) == 0 {
+		http.Error(w, "no tracks to download", 400)
+		return
+	}
+	if len(ids) > maxZipTracks {
+		ids = ids[:maxZipTracks]
+	}
+
+	first, err := s.buildTrackFile(ids[0])
+	if err != nil {
+		log.Printf("zip %q: first track %s failed: %v", zipName, ids[0], err)
+		if errors.Is(err, errTrackNotFound) {
+			http.Error(w, "track not found: "+ids[0], 404)
+		} else {
+			http.Error(w, err.Error(), 502)
+		}
+		return
+	}
+
+	fname := sanitizeFilename(zipName) + ".zip"
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", contentDisposition(fname))
+
+	zw := zip.NewWriter(w)
+	used := map[string]int{}
+	done := 0
+	if werr := writeZipEntry(zw, 1, first, used); werr == nil {
+		done = 1
+	}
+	for i, id := range ids[1:] {
+		tf, err := s.buildTrackFile(id)
+		if err != nil {
+			log.Printf("zip %q: skipping track %s: %v", zipName, id, err)
+			continue
+		}
+		if err := writeZipEntry(zw, i+2, tf, used); err != nil {
+			log.Printf("zip %q: entry write failed: %v", zipName, err)
+			break
+		}
+		done++
+	}
+	log.Printf("zip %q: wrote %d/%d tracks", zipName, done, len(ids))
+	zw.Close()
+}
+
+func trackIDsFromTracks(ts []dzRestTrack) []string {
+	ids := make([]string, 0, len(ts))
+	for _, t := range ts {
+		if id := t.ID.String(); id != "" && id != "0" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// handleAlbumDownload zips every track of an album as tagged audio files.
+func (s *Server) handleAlbumDownload(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	title, artist := "Album", ""
+	var ids []string
+	if b, err := restGet("/album/" + url.PathEscape(id)); err == nil {
+		var alb dzRestAlbumFull
+		if json.Unmarshal(b, &alb) == nil {
+			title = alb.Title
+			artist, _ = joinArtists(alb.Artist, alb.Contributors)
+			ids = trackIDsFromTracks(alb.Tracks.Data)
+		}
+	}
+	if len(ids) == 0 && s.client != nil {
+		if al, serr := s.client.AlbumTracks(id); serr == nil && len(al) > 0 {
+			for _, t := range al {
+				ids = append(ids, t.ID)
+			}
+			if title == "Album" {
+				title = al[0].AlbumName
+			}
+			if artist == "" && len(al) > 0 {
+				artist = al[0].ArtistLine()
+			}
+		}
+	}
+	if len(ids) == 0 {
+		http.Error(w, "album has no downloadable tracks", 404)
+		return
+	}
+	name := "Album"
+	if artist != "" {
+		name = artist + " - " + title
+	} else {
+		name = title
+	}
+	s.serveZip(w, ids, name)
+}
+
+// handlePlaylistDownload zips every track of a Deezer playlist.
+func (s *Server) handlePlaylistDownload(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	title := "Playlist"
+	var ids []string
+	if b, err := restGet("/playlist/" + url.PathEscape(id)); err == nil {
+		var pl dzRestPlaylistFull
+		if json.Unmarshal(b, &pl) == nil {
+			title = pl.Title
+			ids = trackIDsFromTracks(pl.Tracks.Data)
+		}
+	}
+	if len(ids) == 0 && s.client != nil {
+		if ts, serr := s.client.PlaylistTracks(id); serr == nil && len(ts) > 0 {
+			for _, t := range ts {
+				ids = append(ids, t.ID)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		http.Error(w, "playlist has no downloadable tracks", 404)
+		return
+	}
+	s.serveZip(w, ids, title+" - Wowzers")
+}
+
+// handleZipDownload zips an arbitrary list of track ids (?ids=1,2,3), used by
+// local playlists and the queue.
+func (s *Server) handleZipDownload(w http.ResponseWriter, r *http.Request) {
+	raw := strings.TrimSpace(r.URL.Query().Get("ids"))
+	if raw == "" {
+		http.Error(w, "missing ids parameter", 400)
+		return
+	}
+	parts := strings.Split(raw, ",")
+	ids := make([]string, 0, len(parts))
+	seen := map[string]bool{}
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" || p == "0" || seen[p] {
+			continue
+		}
+		if _, err := strconv.Atoi(p); err != nil {
+			continue
+		}
+		seen[p] = true
+		ids = append(ids, p)
+	}
+	s.serveZip(w, ids, "Wowzers Tracks")
+}
+
+// ---------- cover proxy ----------
+
+// artworkCache is a small in-memory cache of CDN cover bytes; covers repeat
+// across tracks of one album, so exact LRU is overkill.
+var artworkCache = struct {
+	sync.Mutex
+	m map[string][]byte
+}{m: map[string][]byte{}}
+
+const artworkCacheMax = 256
+
+func fetchArtworkCached(artURL string) []byte {
+	if artURL == "" {
+		return nil
+	}
+	artworkCache.Lock()
+	if b, ok := artworkCache.m[artURL]; ok {
+		artworkCache.Unlock()
+		return b
+	}
+	artworkCache.Unlock()
+
+	b, err := fetchArtwork(artURL)
+	if err != nil || len(b) == 0 {
+		return nil
+	}
+
+	artworkCache.Lock()
+	if len(artworkCache.m) >= artworkCacheMax {
+		n := artworkCacheMax / 4 // evict an arbitrary quarter
+		for k := range artworkCache.m {
+			delete(artworkCache.m, k)
+			n--
+			if n <= 0 {
+				break
+			}
+		}
+	}
+	artworkCache.m[artURL] = b
+	artworkCache.Unlock()
+	return b
+}
+
+// resolveCoverURL finds the best album-cover URL for a track (or album) id.
+func (s *Server) resolveCoverURL(id string) string {
+	esc := url.PathEscape(id)
+	if b, err := restGet("/track/" + esc); err == nil {
+		var m struct {
+			dzRestTrack
+		}
+		if json.Unmarshal(b, &m) == nil {
+			if u := pickCover(m.Album); u != "" {
+				return u
+			}
+		}
+	}
+	if b, err := restGet("/album/" + esc); err == nil {
+		var alb dzRestAlbumFull
+		if json.Unmarshal(b, &alb) == nil {
+			if u := pickCover(dzRestAlbum{CoverXL: alb.CoverXL, CoverBig: alb.CoverBig, CoverMedium: alb.CoverMedium}); u != "" {
+				return u
+			}
+		}
+	}
+	if s.client != nil {
+		if t, terr := s.client.Track(id); terr == nil && t.ArtworkURL != "" {
+			return t.ArtworkURL
+		}
+	}
+	return ""
+}
+
+// handleCover serves GET /api/cover/{id} — the album artwork for a track or
+// album id, proxied through the server so the browser never depends on CDN
+// hotlink behavior.
+func (s *Server) handleCover(w http.ResponseWriter, r *http.Request) {
+	u := s.resolveCoverURL(r.PathValue("id"))
+	if u == "" {
+		http.Error(w, "cover not found", 404)
+		return
+	}
+	art := fetchArtworkCached(u)
+	if len(art) == 0 {
+		http.Error(w, "cover fetch failed", 502)
+		return
+	}
+	mime := sniffImageMIME(art)
+	if mime == "" {
+		mime = "image/jpeg"
+	}
+	w.Header().Set("Content-Type", mime)
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("Content-Length", strconv.Itoa(len(art)))
+	w.Write(art)
+}
+
+// ---------- TuneMyMusic CSV import (strict title/artist/album matching) ----------
+
+// maxCSVRows caps one import: matching hits the public Deezer API once or
+// twice per row, so imports beyond this size would only trip rate limits.
+const maxCSVRows = 10000
+
+// maxMatchConcurrency keeps row-matching requests gentle on the public API.
+const maxMatchConcurrency = 5
+
+// maxReportedSkipped caps the skipped-rows list in the JSON report.
+const maxReportedSkipped = 500
+
+// skippedRow is a CSV row that had NO strictly-matching Deezer track.
+type skippedRow struct {
+	Row    int    `json:"row"`
+	Title  string `json:"title"`
+	Artist string `json:"artist"`
+	Album  string `json:"album"`
+	Reason string `json:"reason"`
+}
+
+// importedPlaylist groups the import result for one "Playlist name" column.
+type importedPlaylist struct {
+	Name       string  `json:"name"`
+	Matched    int     `json:"matched"`
+	Skipped    int     `json:"skipped"`
+	Tracks     []Track `json:"tracks"`
+	DeezerID   string  `json:"deezerPlaylistId,omitempty"`
+	DeezerSync string  `json:"deezerSync"` // created | updated | failed | skipped
+	DeezerNote string  `json:"deezerNote,omitempty"`
+}
+
+// importReport is the JSON response of POST /api/import/csv.
+type importReport struct {
+	TotalRows        int                `json:"totalRows"`
+	MatchedRows      int                `json:"matchedRows"`
+	SkippedRows      int                `json:"skippedRows"`
+	SkippedTruncated bool               `json:"skippedTruncated,omitempty"`
+	Playlists        []importedPlaylist `json:"playlists"`
+	Skipped          []skippedRow       `json:"skipped"`
+}
+
+// csvRow is one data line of a TuneMyMusic export.
+type csvRow struct {
+	Line     int
+	Title    string
+	Artist   string
+	Album    string
+	Playlist string
+	RowType  string
+	ISRC     string
+}
+
+// normalizeForMatch reduces a name to its comparable core: lowercase,
+// whitespace collapsed and every character that is not a letter or digit
+// dropped, with diacritics folded. Apostrophes are removed entirely (they sit
+// inside words: "It's" == "Its" == "It s"-free), any other punctuation is a
+// word separator ("AC/DC" == "ac dc"). Comparisons stay STRICT: after
+// normalization the whole word sequence must be identical, so
+// "It's me, It's Verity" == "It's Me, It's Verity" but
+// "keep me going (BIRDBRAIN)" != "keep me going".
+func normalizeForMatch(s string) string {
+	s = norm.NFD.String(strings.TrimSpace(s))
+	var out []rune
+	space := true // leading space suppressed
+	for _, r := range s {
+		if unicode.Is(unicode.Mn, r) { // combining mark (folded accent)
+			continue
+		}
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			out = append(out, unicode.ToLower(r))
+			space = false
+		} else if isApostrophe(r) {
+			// within-word punctuation — dropped, not a separator
+		} else if !space {
+			out = append(out, ' ')
+			space = true
+		}
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func isApostrophe(r rune) bool {
+	switch r {
+	case '\'', '’', 'ʼ', '‘', '`', '´', 'ʻ':
+		return true
+	}
+	return false
+}
+
+// artistFeatSplit separates featuring markers ("feat.", "ft.", "featuring")
+// that Spotify exports spell in various ways.
+var artistFeatSplit = regexp.MustCompile(`(?i)\b(?:featuring|feat|ft)\b\.?`)
+
+// splitArtistTokens splits a CSV "Artist name" cell into individual artists,
+// dropping separators (, & / ; |) and featuring markers.
+func splitArtistTokens(s string) []string {
+	s = artistFeatSplit.ReplaceAllString(strings.TrimSpace(s), ",")
+	parts := strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == '&' || r == '/' || r == ';' || r == '|'
+	})
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// csvArtistsCredited reports whether EVERY artist named in the CSV row is
+// credited on the Deezer track (main artist or any contributor).
+func csvArtistsCredited(csvArtist string, dt dzRestTrack) bool {
+	credited := map[string]bool{}
+	add := func(a dzRestArtist) {
+		if n := normalizeForMatch(a.Name); n != "" {
+			credited[n] = true
+		}
+	}
+	add(dt.Artist)
+	for _, a := range dt.Contributors {
+		add(a)
+	}
+	tokens := splitArtistTokens(csvArtist)
+	if len(tokens) == 0 {
+		return false
+	}
+	for _, t := range tokens {
+		if !credited[normalizeForMatch(t)] {
+			return false
+		}
+	}
+	return true
+}
+
+// strictTrackMatch verifies that a Deezer track is EXACTLY the track the CSV
+// row describes: title and album identical after normalization and every CSV
+// artist credited. An empty album cell cannot be verified and is ignored.
+func strictTrackMatch(row csvRow, dt dzRestTrack) (bool, string) {
+	if normalizeForMatch(row.Title) == "" || normalizeForMatch(row.Title) != normalizeForMatch(dt.Title) {
+		return false, "title mismatch"
+	}
+	if !csvArtistsCredited(row.Artist, dt) {
+		return false, "artist mismatch"
+	}
+	if strings.TrimSpace(row.Album) != "" &&
+		normalizeForMatch(row.Album) != normalizeForMatch(dt.Album.Title) {
+		return false, "album mismatch"
+	}
+	return true, ""
+}
+
+// parseTuneMyMusicCSV parses a TuneMyMusic/Spotify export. Columns are
+// located by header name, so extra columns and different spellings
+// ("Track name", "Track Name") are tolerated.
+func parseTuneMyMusicCSV(data []byte) ([]csvRow, error) {
+	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf")) // UTF-8 BOM
+	r := csv.NewReader(bytes.NewReader(data))
+	r.FieldsPerRecord = -1 // tolerate ragged rows
+	r.LazyQuotes = true
+
+	get := func(rec []string, ci int) string {
+		if ci < 0 || ci >= len(rec) {
+			return ""
+		}
+		return strings.TrimSpace(rec[ci])
+	}
+
+	var header []string
+	var headerCols [6]int
+	rows := make([]csvRow, 0, 64)
+	for {
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("invalid csv: %w", err)
+		}
+		// True 1-based CSV line number (encoding/csv silently skips
+		// blank lines, so counting records would drift).
+		line, _ := r.FieldPos(0)
+		if header == nil {
+			header = rec
+			idx := map[string]int{}
+			for i, h := range header {
+				idx[strings.ToLower(strings.TrimSpace(h))] = i
+			}
+			col := func(name string) int {
+				if i, ok := idx[name]; ok {
+					return i
+				}
+				for k, i := range idx {
+					if strings.Contains(k, name) {
+						return i
+					}
+				}
+				return -1
+			}
+			if col("track") < 0 || col("artist") < 0 {
+				return nil, fmt.Errorf("not a TuneMyMusic export: no \"Track name\"/\"Artist name\" columns")
+			}
+			headerCols = [6]int{col("track"), col("artist"), col("album"), col("playlist"), col("type"), col("isrc")}
+			continue
+		}
+		row := csvRow{
+			Line:     line,
+			Title:    get(rec, headerCols[0]),
+			Artist:   get(rec, headerCols[1]),
+			Album:    get(rec, headerCols[2]),
+			Playlist: get(rec, headerCols[3]),
+			RowType:  get(rec, headerCols[4]),
+			ISRC:     strings.ToUpper(get(rec, headerCols[5])),
+		}
+		if row.Title == "" && row.Artist == "" && row.Album == "" {
+			continue // fully blank line
+		}
+		rows = append(rows, row)
+	}
+	if header == nil {
+		return nil, fmt.Errorf("csv has no data rows")
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("csv has no usable rows")
+	}
+	if len(rows) > maxCSVRows {
+		rows = rows[:maxCSVRows]
+	}
+	return rows, nil
+}
+
+// matchRow resolves one CSV row to a Deezer track. An ISRC hit is held to the
+// SAME strict name check; if the names differ the search index is consulted
+// before the row is reported as skipped (with the exact reason).
+func (s *Server) matchRow(row csvRow) (dzRestTrack, string) {
+	isrcWhy := ""
+	if row.ISRC != "" {
+		if b, err := restGet("/track/isrc:" + url.PathEscape(row.ISRC)); err == nil {
+			var dt dzRestTrack
+			if json.Unmarshal(b, &dt) == nil && dt.ID.String() != "" && dt.ID.String() != "0" {
+				if ok, why := strictTrackMatch(row, dt); ok {
+					return dt, "isrc"
+				} else {
+					isrcWhy = fmt.Sprintf("ISRC %s resolves to %q but %s", row.ISRC, dt.Title, why)
+				}
+			}
+		}
+	}
+	q := url.QueryEscape(strings.TrimSpace(row.Artist + " " + row.Title))
+	if b, err := restGet("/search/track?q=" + q + "&limit=10"); err == nil {
+		var res struct {
+			Data []dzRestTrack `json:"data"`
+		}
+		if json.Unmarshal(b, &res) == nil {
+			for _, dt := range res.Data {
+				if ok, _ := strictTrackMatch(row, dt); ok {
+					return dt, "search"
+				}
+			}
+		}
+	}
+	if isrcWhy != "" {
+		return dzRestTrack{}, isrcWhy + "; search found no strict match either"
+	}
+	return dzRestTrack{}, "no Deezer track matched title + artist + album"
+}
+
+// handleImportCSV implements POST /api/import/csv for TuneMyMusic exports.
+// Every row is resolved to a Deezer track ONLY when title, artist and album
+// names strictly match; unmatched rows are skipped and reported. Matched
+// tracks are written to real Deezer playlists (one per "Playlist name",
+// reusing a playlist of the same name when it exists) unless ?sync=0, and
+// returned as Track objects so the browser can mirror them into local
+// playlists for in-app playback.
+func (s *Server) handleImportCSV(w http.ResponseWriter, r *http.Request) {
+	syncDeezer := r.URL.Query().Get("sync") != "0"
+
+	var data []byte
+	var err error
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			http.Error(w, "invalid upload: "+err.Error(), 400)
+			return
+		}
+		file, _, ferr := r.FormFile("file")
+		if ferr != nil {
+			http.Error(w, `missing "file" field — attach the TuneMyMusic CSV`, 400)
+			return
+		}
+		defer file.Close()
+		data, err = io.ReadAll(io.LimitReader(file, 32<<20))
+	} else {
+		// Raw CSV body (curl --data-binary @file.csv style).
+		data, err = io.ReadAll(http.MaxBytesReader(w, r.Body, 32<<20))
+	}
+	if err != nil {
+		http.Error(w, "read failed: "+err.Error(), 400)
+		return
+	}
+	rows, err := parseTuneMyMusicCSV(data)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	log.Printf("csv import: %d rows (deezer sync: %v)", len(rows), syncDeezer)
+	writeJSON(w, s.runImport(rows, syncDeezer))
+}
+
+// runImport matches every row, groups the matches per playlist name and —
+// when asked — creates/updates the matching Deezer account playlists.
+func (s *Server) runImport(rows []csvRow, syncDeezer bool) *importReport {
+	report := &importReport{
+		TotalRows: len(rows),
+		Skipped:   []skippedRow{},
+		Playlists: []importedPlaylist{},
+	}
+
+	// Resolve all rows concurrently; the public REST API is the bottleneck.
+	type outcome struct {
+		track *Track
+		via   string
+		why   string
+	}
+	outcomes := make([]outcome, len(rows))
+	sem := make(chan struct{}, maxMatchConcurrency)
+	var wg sync.WaitGroup
+	for i := range rows {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			dt, via := s.matchRow(rows[i])
+			if dt.ID.String() == "" || dt.ID.String() == "0" {
+				outcomes[i] = outcome{why: via}
+				return
+			}
+			t := trackFromRest(dt)
+			outcomes[i] = outcome{track: &t, via: via}
+		}(i)
+	}
+	wg.Wait()
+
+	// Group per playlist (CSV order preserved, rows de-duplicated) and
+	// collect the skip report.
+	grouped := map[string][]Track{}
+	seenInPl := map[string]map[string]bool{}
+	skippedByPl := map[string]int{}
+	for i := range rows {
+		name := strings.TrimSpace(rows[i].Playlist)
+		if name == "" {
+			name = "Imported Tracks" // rows exported without a playlist
+		}
+		o := outcomes[i]
+		if o.track == nil {
+			if len(report.Skipped) < maxReportedSkipped {
+				report.Skipped = append(report.Skipped, skippedRow{
+					Row:    rows[i].Line,
+					Title:  rows[i].Title,
+					Artist: rows[i].Artist,
+					Album:  rows[i].Album,
+					Reason: o.why,
+				})
+			}
+			skippedByPl[name]++
+			continue
+		}
+		report.MatchedRows++
+		if seenInPl[name] == nil {
+			seenInPl[name] = map[string]bool{}
+		}
+		if seenInPl[name][o.track.ID] {
+			continue // the same track listed twice in the CSV
+		}
+		seenInPl[name][o.track.ID] = true
+		grouped[name] = append(grouped[name], *o.track)
+	}
+	if len(report.Skipped) < len(rows)-report.MatchedRows {
+		report.SkippedTruncated = true
+	}
+
+	names := make([]string, 0, len(grouped))
+	for name := range grouped {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		pl := importedPlaylist{
+			Name:       name,
+			Matched:    len(grouped[name]),
+			Skipped:    skippedByPl[name],
+			Tracks:     grouped[name],
+			DeezerSync: "skipped",
+		}
+		ids := make([]string, 0, len(grouped[name]))
+		for _, t := range grouped[name] {
+			ids = append(ids, t.ID)
+		}
+		if syncDeezer && s.client != nil && len(ids) > 0 {
+			s.syncPlaylistToDeezer(&pl, ids)
+		}
+		report.Playlists = append(report.Playlists, pl)
+	}
+	report.SkippedRows = len(rows) - report.MatchedRows
+	log.Printf("csv import done: %d/%d matched, %d playlist(s)", report.MatchedRows, report.TotalRows, len(report.Playlists))
+	return report
+}
+
+// syncPlaylistToDeezer creates (or reuses) the Deezer playlist and adds every
+// matched track. SDK calls are serialized behind s.mu like the rest of the
+// auth-gated handlers; failures are reported per playlist instead of failing
+// the whole import.
+func (s *Server) syncPlaylistToDeezer(pl *importedPlaylist, ids []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Reuse an existing Deezer playlist of the same name when there is one.
+	var existingID string
+	if pls, err := s.client.Playlists(); err == nil {
+		for _, p := range pls {
+			if strings.EqualFold(strings.TrimSpace(p.Name), pl.Name) {
+				existingID = p.ID
+				break
+			}
+		}
+	}
+	if existingID != "" {
+		for _, id := range ids {
+			if err := s.client.AddToPlaylist(existingID, id); err != nil {
+				pl.DeezerSync = "failed"
+				pl.DeezerNote = err.Error()
+				return
+			}
+		}
+		pl.DeezerID = existingID
+		pl.DeezerSync = "updated"
+		return
+	}
+
+	// Create the playlist with the first chunk (the gw call embeds every
+	// id in one request) and append the rest in small batches.
+	const chunk = 25
+	first, rest := ids, []string(nil)
+	if len(ids) > chunk {
+		first, rest = ids[:chunk], ids[chunk:]
+	}
+	pid, err := s.client.CreatePlaylist(pl.Name, first)
+	if err != nil {
+		pl.DeezerSync = "failed"
+		pl.DeezerNote = err.Error()
+		return
+	}
+	pl.DeezerID = pid
+	for _, id := range rest {
+		if err := s.client.AddToPlaylist(pid, id); err != nil {
+			pl.DeezerSync = "created"
+			pl.DeezerNote = fmt.Sprintf("created but some tracks could not be added: %v", err)
+			return
+		}
+	}
+	pl.DeezerSync = "created"
 }
 
 // ---------- tagging (MP3 / FLAC) ----------
