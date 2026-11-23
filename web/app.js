@@ -959,8 +959,8 @@ document.getElementById("createPlBtn").onclick = () => {
 
 // ---------- TuneMyMusic CSV Import ----------
 // The server matches every row against Deezer (strict title + artist + album);
-// matched tracks are written to real Deezer playlists AND mirrored into local
-// playlists here so they are playable in-app and in the queue.
+// matched tracks are mirrored into LOCAL playlists here so they are playable
+// in-app and in the queue. Nothing is ever written to the Deezer account.
 async function importTuneMyMusicCSV(file) {
     if (!file) return;
     const modal = document.getElementById("importReportModal");
@@ -989,15 +989,9 @@ async function importTuneMyMusicCSV(file) {
 function renderImportReport(report) {
     document.getElementById("importReportTitle").textContent = "Import report";
     const body = document.getElementById("importReportBody");
-    const pls = (report.playlists || []).map(p => {
-        let sync = "";
-        if (p.deezerPlaylistId) {
-            sync = ` • Deezer: <a href="https://www.deezer.com/playlist/${encodeURIComponent(p.deezerPlaylistId)}" target="_blank" rel="noopener">${escapeHtml(p.deezerSync)}</a>`;
-        } else if (p.deezerSync === "failed") {
-            sync = ` • Deezer: failed${p.deezerNote ? " (" + escapeHtml(p.deezerNote) + ")" : ""}`;
-        }
-        return `<div class="report-pl"><strong>${escapeHtml(p.name)}</strong> — ${p.matched} matched, ${p.skipped} skipped${sync}</div>`;
-    }).join("");
+    const pls = (report.playlists || []).map(p =>
+        `<div class="report-pl"><strong>${escapeHtml(p.name)}</strong> — ${p.matched} matched, ${p.skipped} skipped</div>`
+    ).join("");
     const skipped = (report.skipped || []).map(s =>
         `<div class="report-skip"><span class="r-title">${escapeHtml(s.title || "(blank)")}</span> — ${escapeHtml(s.artist || "?")} <em>(${escapeHtml(s.album || "no album")})</em>: ${escapeHtml(s.reason)}</div>`
     ).join("");
@@ -1005,7 +999,7 @@ function renderImportReport(report) {
         <p class="hint">${report.matchedRows}/${report.totalRows} rows strictly matched and imported${report.skippedTruncated ? " (skipped list truncated)" : ""}.</p>
         ${pls || ""}
         ${skipped ? `<h4>Skipped — no strict match found</h4>${skipped}` : `<p class="hint">Nothing was skipped.</p>`}
-        <p class="hint">Matched tracks are saved as local playlists (playable right away) and on your Deezer account.</p>
+        <p class="hint">Matched tracks are saved as local playlists (playable right away). Nothing is ever written to your Deezer account.</p>
     `;
 }
 
