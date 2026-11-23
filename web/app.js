@@ -16,7 +16,7 @@ let state = {
 let currentTab = "search";
 let lastSearchResults = null;
 let searchSubTab = "tracks";
-let trackToAddToPl = null;
+let tracksToAddToPl = []; // one track or a whole album/playlist
 let currentBlobUrl = null;
 
 // Web Audio variables
@@ -86,10 +86,13 @@ function toggleLocalFav(t) {
     localStorage.setItem("wowzers_favorites", JSON.stringify(favs));
 }
 function getLocalPlaylists() { return JSON.parse(localStorage.getItem("wowzers_playlists") || "{}"); }
-function addToLocalPlaylist(name, track) {
+function addToLocalPlaylist(name, tracks) {
+    if (!Array.isArray(tracks)) tracks = [tracks];
     let pls = getLocalPlaylists();
     if (!pls[name]) pls[name] = [];
-    if (!pls[name].some(t => t.id === track.id)) pls[name].push(track);
+    tracks.forEach(t => {
+        if (t && t.id && !pls[name].some(x => x.id === t.id)) pls[name].push(t);
+    });
     localStorage.setItem("wowzers_playlists", JSON.stringify(pls));
 }
 function getLocalHistory() { return JSON.parse(localStorage.getItem("wowzers_history") || "[]"); }
@@ -228,6 +231,12 @@ async function playTrackAt(i) {
     updateUI();
     addToLocalHistory(state.track);
 
+    // Invalidate any preload belonging to the previous track (the in-flight
+    // fetch is aborted — the new track preloads its own successor near its end).
+    if (preloadAbort) { preloadAbort.abort(); preloadAbort = null; }
+    preloadedFor = null;
+    preloadedNextId = null;
+
     const id = state.track.id;
     
     // Check IndexedDB cache first
@@ -276,9 +285,22 @@ function next() {
     }
     let idx = state.queueIndex + 1;
     if (state.shuffle && state.queue.length > 1) {
-        let randIdx;
-        do { randIdx = Math.floor(Math.random() * state.queue.length); } while (randIdx === state.queueIndex);
-        idx = randIdx;
+        // Reuse the successor chosen at preload time when there is one — that
+        // is the track already sitting in the cache, so it starts gaplessly.
+        const curId = state.track ? state.track.id : null;
+        let reused = false;
+        if (curId && preloadedFor === curId && preloadedNextId) {
+            const pIdx = state.queue.findIndex(x => x && x.id === preloadedNextId);
+            if (pIdx !== -1 && pIdx !== state.queueIndex) {
+                idx = pIdx;
+                reused = true;
+            }
+        }
+        if (!reused) {
+            let randIdx;
+            do { randIdx = Math.floor(Math.random() * state.queue.length); } while (randIdx === state.queueIndex);
+            idx = randIdx;
+        }
     }
     if (idx >= state.queue.length) {
         if (state.repeat === "all" && state.queue.length > 0) idx = 0;
@@ -433,8 +455,7 @@ document.getElementById("npFavBtn").onclick = () => {
 };
 document.getElementById("npPlBtn").onclick = () => {
     if (!state.track) return;
-    trackToAddToPl = state.track;
-    openPlaylistModal();
+    openPlaylistModal([state.track]);
 };
 
 function bindTransport(btnId, fn) {
@@ -457,6 +478,71 @@ function downloadTrack(t) {
     document.body.appendChild(a);
     a.click();
     a.remove();
+}
+// downloadZip saves a batch download (album / playlist / id list) as one ZIP.
+function downloadZip(url) {
+    const a = document.createElement("a");
+    a.href = url;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+}
+
+// ---------- Gapless preloading ----------
+// The next track is fetched into the IndexedDB cache once the current one has
+// 15 seconds or less remaining, so playback continues without a network gap.
+// The preloaded blob is NEVER played early — the current track keeps playing
+// to its natural end, and when "ended" fires, playTrackAt finds the blob in
+// the cache and starts instantly. Repeat-one never preloads (the same track
+// replays from cache anyway).
+let preloadedFor = null;    // track id whose successor was preloaded
+let preloadedNextId = null; // successor id that was fetched into the cache
+let preloadAbort = null;    // cancels the in-flight preload on track change
+const PRELOAD_WINDOW_MS = 15000;
+
+// nextTrackIdForPreload mirrors next()'s queue logic (shuffle / repeat) and
+// returns the id that will play after the current one, or null when nothing
+// follows (repeat-one, empty queue, end of queue without repeat-all).
+function nextTrackIdForPreload() {
+    if (state.repeat === "one") return null;
+    if (!state.queue.length || state.queueIndex < 0) return null;
+    let idx = state.queueIndex + 1;
+    if (state.shuffle && state.queue.length > 1) {
+        do { idx = Math.floor(Math.random() * state.queue.length); } while (idx === state.queueIndex);
+    }
+    if (idx >= state.queue.length) {
+        if (state.repeat === "all") idx = 0;
+        else return null;
+    }
+    const t = state.queue[idx];
+    return t && t.id ? t.id : null;
+}
+
+function preloadNextTrack() {
+    if (!state.track || state.player !== "playing") return;
+    if (preloadedFor === state.track.id) return; // one successor per track
+    const nextId = nextTrackIdForPreload();
+    if (!nextId) {
+        preloadedFor = state.track.id; // nothing follows — don't retry every tick
+        return;
+    }
+    if (preloadAbort) preloadAbort.abort();
+    preloadAbort = new AbortController();
+    preloadedFor = state.track.id;
+    preloadedNextId = nextId;
+    getCachedTrack(nextId).then(cached => {
+        if (cached) return; // already cached — it will start instantly
+        return fetch("/api/stream/" + encodeURIComponent(nextId), { signal: preloadAbort.signal })
+            .then(res => {
+                if (!res.ok) throw new Error("preload HTTP " + res.status);
+                return res.blob();
+            })
+            .then(blob => cacheTrack(nextId, blob))
+            .catch(err => {
+                if (!err || err.name !== "AbortError") console.warn("preload failed:", err);
+            });
+    }).catch(() => {});
 }
 document.getElementById("npDownBtn").onclick = () => downloadTrack(state.track);
 
@@ -527,6 +613,13 @@ audio.addEventListener("timeupdate", () => {
         if (seek) seek.value = v;
         if (npSeek) npSeek.value = v;
     }
+
+    // Gapless preload: with 15 seconds (or less) left on the current track,
+    // fetch the next one into the cache so it can start without a network gap.
+    const durMS = (isFinite(audio.duration) && audio.duration > 0)
+        ? audio.duration * 1000
+        : (state.track && state.track.durationMs ? state.track.durationMs : 0);
+    if (durMS > 0 && durMS - v <= PRELOAD_WINDOW_MS) preloadNextTrack();
 });
 
 // ---------- Nav ----------
@@ -636,8 +729,7 @@ function trackRow(t, queueContext, queueIdx) {
     
     el.querySelector(".add-pl-btn").onclick = (e) => {
         e.stopPropagation();
-        trackToAddToPl = t;
-        openPlaylistModal();
+        openPlaylistModal([t]);
     };
     
     el.onclick = () => {
@@ -711,10 +803,16 @@ async function loadAlbum(id) {
         <div class="album-meta">
             <h1>${escapeHtml(data.title)}</h1>
             <p>${escapeHtml(data.artist)}${data.year ? " • " + escapeHtml(data.year) : ""} • ${data.nbTracks || (data.tracks || []).length} tracks</p>
-            <button class="album-play-btn">Play Album</button>
+            <div class="playlist-actions">
+                <button class="album-play-btn">Play Album</button>
+                <button class="album-play-btn zip-btn" title="Download the album as a ZIP of tagged MP3/FLAC files">⬇ ZIP</button>
+                <button class="album-play-btn pl-btn" title="Add every track of this album to a playlist">📚 Playlist</button>
+            </div>
         </div>
     `;
     header.querySelector(".album-play-btn").onclick = () => playTrackNow(data.tracks[0], data.tracks);
+    header.querySelector(".zip-btn").onclick = () => downloadZip("/api/download/album/" + encodeURIComponent(id));
+    header.querySelector(".pl-btn").onclick = () => openPlaylistModal(data.tracks || []);
     view.appendChild(header);
     
     const list = document.createElement("div");
@@ -722,6 +820,52 @@ async function loadAlbum(id) {
     data.tracks.forEach(t => list.appendChild(trackRow(t, data.tracks)));
     view.appendChild(list);
     
+    c.appendChild(view);
+}
+
+// loadDeezerPlaylist renders a Deezer (account) playlist with the exact same
+// album-style layout used by loadAlbum: big cover header, Play / Shuffle /
+// ZIP actions and the full multi-artist track list.
+async function loadDeezerPlaylist(id) {
+    const data = await api("/api/playlist/" + encodeURIComponent(id));
+    const tracks = data.tracks || [];
+    document.getElementById("contentTitle").textContent = data.title || "Playlist";
+    const c = document.getElementById("content");
+    c.innerHTML = "";
+
+    const view = document.createElement("div");
+    view.className = "album-view";
+
+    const header = document.createElement("div");
+    header.className = "album-header";
+    header.innerHTML = `
+        <img src="${data.cover || "/icon.svg"}" alt="">
+        <div class="album-meta">
+            <h1>${escapeHtml(data.title || "Playlist")}</h1>
+            <p>Deezer Playlist${data.owner ? " by " + escapeHtml(data.owner) : ""} • ${data.nbTracks || tracks.length} tracks</p>
+            <div class="playlist-actions">
+                <button class="album-play-btn">Play</button>
+                <button class="album-play-btn shuffle-btn">Shuffle</button>
+                <button class="album-play-btn zip-btn" title="Download the playlist as a ZIP of tagged MP3/FLAC files">⬇ ZIP</button>
+            </div>
+        </div>
+    `;
+    if (tracks.length) {
+        header.querySelector(".album-play-btn").onclick = () => playTrackNow(tracks[0], tracks);
+        header.querySelector(".shuffle-btn").onclick = () => {
+            state.shuffle = true;
+            playTrackNow(tracks[0], tracks);
+            setTimeout(() => { state.shuffle = false; updateUI(); }, 1000);
+        };
+    }
+    header.querySelector(".zip-btn").onclick = () => downloadZip("/api/download/playlist/" + encodeURIComponent(id));
+    view.appendChild(header);
+
+    const list = document.createElement("div");
+    list.className = "list";
+    tracks.forEach(t => list.appendChild(trackRow(t, tracks)));
+    view.appendChild(list);
+
     c.appendChild(view);
 }
 
@@ -739,25 +883,51 @@ function loadLocalFavs() {
     c.appendChild(list);
 }
 
-function loadLocalPlaylists() {
+async function loadLocalPlaylists() {
     const pls = getLocalPlaylists();
     const c = document.getElementById("content"); c.innerHTML = "";
-    document.getElementById("contentTitle").textContent = "Local Playlists";
+    document.getElementById("contentTitle").textContent = "Playlists";
     
     if (Object.keys(pls).length === 0) {
-        c.innerHTML = `<p class="hint">No playlists yet. Click the 📚 button on tracks to create one.</p>`;
-        return;
+        c.innerHTML = `<p class="hint">No local playlists yet. Click the 📚 button on tracks to create one, or import a TuneMyMusic CSV below.</p>`;
+    } else {
+        const grid = document.createElement("div"); grid.className = "grid";
+        Object.keys(pls).forEach(name => {
+            const el = document.createElement("div"); el.className = "card";
+            const firstTrack = pls[name][0];
+            el.innerHTML = `<img src="${(firstTrack && firstTrack.cover) || "/icon.svg"}" alt=""><div class="title">${escapeHtml(name)}</div><div class="subtitle">${pls[name].length} tracks</div>`;
+            el.onclick = () => loadLocalPlaylist(name);
+            grid.appendChild(el);
+        });
+        c.appendChild(grid);
     }
-    
-    const grid = document.createElement("div"); grid.className = "grid";
-    Object.keys(pls).forEach(name => {
-        const el = document.createElement("div"); el.className = "card";
-        const firstTrack = pls[name][0];
-        el.innerHTML = `<img src="${(firstTrack && firstTrack.cover) || "/icon.svg"}" alt=""><div class="title">${escapeHtml(name)}</div><div class="subtitle">${pls[name].length} tracks</div>`;
-        el.onclick = () => loadLocalPlaylist(name);
-        grid.appendChild(el);
-    });
-    c.appendChild(grid);
+
+    // Deezer account playlists (CSV imports, followed playlists, ...).
+    try {
+        const dzPls = await api("/api/playlists");
+        if (Array.isArray(dzPls) && dzPls.length) {
+            const sec = document.createElement("div"); sec.className = "section-gap";
+            sec.innerHTML = `<h3 style="margin-bottom:16px;">Deezer playlists</h3>`;
+            const grid = document.createElement("div"); grid.className = "grid";
+            dzPls.forEach(p => {
+                const el = document.createElement("div"); el.className = "card";
+                el.innerHTML = `<img src="${p.cover || "/icon.svg"}" alt=""><div class="title">${escapeHtml(p.title)}</div><div class="subtitle">${p.nbTracks || 0} tracks</div>`;
+                el.onclick = () => loadDeezerPlaylist(p.id);
+                grid.appendChild(el);
+            });
+            sec.appendChild(grid);
+            c.appendChild(sec);
+        }
+    } catch (e) { /* account playlists unavailable — local section still works */ }
+
+    // CSV import entry point.
+    const csvSec = document.createElement("div"); csvSec.className = "section-gap";
+    csvSec.innerHTML = `
+        <button id="csvImportInlineBtn" class="album-play-btn zip-btn">⬆ Import TuneMyMusic CSV</button>
+        <p class="hint">Rows are imported only when track title, artist AND album names strictly match a Deezer track. Everything unmatched is listed in the report, so nothing wrong ever lands in your library.</p>
+    `;
+    c.appendChild(csvSec);
+    document.getElementById("csvImportInlineBtn").onclick = () => document.getElementById("csvFile").click();
 }
 
 async function loadLocalPlaylist(name) {
@@ -779,6 +949,7 @@ async function loadLocalPlaylist(name) {
             <div class="playlist-actions">
                 <button class="album-play-btn">Play</button>
                 <button class="album-play-btn shuffle-btn">Shuffle</button>
+                <button class="album-play-btn zip-btn" title="Download the playlist as a ZIP of tagged MP3/FLAC files">⬇ ZIP</button>
             </div>
         </div>
     `;
@@ -788,6 +959,10 @@ async function loadLocalPlaylist(name) {
         state.shuffle = true;
         playTrackNow(tracks[0], tracks);
         setTimeout(() => { state.shuffle = false; updateUI(); }, 1000);
+    };
+    header.querySelector(".zip-btn").onclick = () => {
+        const ids = tracks.map(t => t.id).filter(Boolean).join(",");
+        if (ids) downloadZip("/api/download/zip?ids=" + encodeURIComponent(ids));
     };
     view.appendChild(header);
     
@@ -800,9 +975,15 @@ async function loadLocalPlaylist(name) {
 }
 
 // ---------- Playlist Modal ----------
-function openPlaylistModal() {
+// openPlaylistModal adds one track or a whole album/playlist
+// (tracks array) to a local playlist.
+function openPlaylistModal(tracks) {
+    if (!Array.isArray(tracks)) tracks = tracks ? [tracks] : [];
+    tracksToAddToPl = tracks.filter(t => t && t.id);
     const modal = document.getElementById("playlistModal");
     const list = document.getElementById("localPlList");
+    document.getElementById("playlistModalTitle").textContent =
+        tracksToAddToPl.length > 1 ? `Add ${tracksToAddToPl.length} tracks to Playlist` : "Add to Playlist";
     list.innerHTML = "";
     const pls = getLocalPlaylists();
     const names = Object.keys(pls);
@@ -815,9 +996,12 @@ function openPlaylistModal() {
             btn.className = "pl-item";
             btn.textContent = `${name} (${pls[name].length} tracks)`;
             btn.onclick = () => {
-                addToLocalPlaylist(name, trackToAddToPl);
-                alert(`Added to ${name}!`);
+                addToLocalPlaylist(name, tracksToAddToPl);
+                alert(tracksToAddToPl.length > 1
+                    ? `Added ${tracksToAddToPl.length} tracks to ${name}!`
+                    : `Added to ${name}!`);
                 modal.classList.add("hidden");
+                if (currentTab === "local_pl") loadLocalPlaylists();
             };
             list.appendChild(btn);
         });
@@ -828,10 +1012,72 @@ function openPlaylistModal() {
 document.getElementById("createPlBtn").onclick = () => {
     const name = document.getElementById("newPlName").value.trim();
     if (!name) return;
-    addToLocalPlaylist(name, trackToAddToPl);
-    alert(`Created ${name} and added track!`);
+    addToLocalPlaylist(name, tracksToAddToPl);
+    alert(tracksToAddToPl.length > 0
+        ? `Created ${name} and added ${tracksToAddToPl.length} track${tracksToAddToPl.length > 1 ? "s" : ""}!`
+        : `Created ${name}.`);
     document.getElementById("playlistModal").classList.add("hidden");
     document.getElementById("newPlName").value = "";
+    if (currentTab === "local_pl") loadLocalPlaylists();
+};
+
+// ---------- TuneMyMusic CSV Import ----------
+// The server matches every row against Deezer (strict title + artist + album);
+// matched tracks are written to real Deezer playlists AND mirrored into local
+// playlists here so they are playable in-app and in the queue.
+async function importTuneMyMusicCSV(file) {
+    if (!file) return;
+    const modal = document.getElementById("importReportModal");
+    const body = document.getElementById("importReportBody");
+    document.getElementById("importReportTitle").textContent = "Importing CSV…";
+    body.innerHTML = `<p class="hint">Uploading and strictly matching every row against Deezer (title + artist + album). Large libraries can take a few minutes — the page keeps working meanwhile.</p>`;
+    modal.classList.remove("hidden");
+    try {
+        const fd = new FormData();
+        fd.append("file", file, file.name || "library.csv");
+        const r = await fetch("/api/import/csv", { method: "POST", body: fd });
+        const text = await r.text();
+        if (!r.ok) throw new Error(text || r.statusText || "Import failed");
+        const report = JSON.parse(text);
+        (report.playlists || []).forEach(p => {
+            if (p.tracks && p.tracks.length) addToLocalPlaylist(p.name, p.tracks);
+        });
+        renderImportReport(report);
+        if (currentTab === "local_pl") loadLocalPlaylists();
+    } catch (e) {
+        document.getElementById("importReportTitle").textContent = "Import failed";
+        body.innerHTML = `<p class="hint">${escapeHtml(String(e.message || e))}</p>`;
+    }
+}
+
+function renderImportReport(report) {
+    document.getElementById("importReportTitle").textContent = "Import report";
+    const body = document.getElementById("importReportBody");
+    const pls = (report.playlists || []).map(p => {
+        let sync = "";
+        if (p.deezerPlaylistId) {
+            sync = ` • Deezer: <a href="https://www.deezer.com/playlist/${encodeURIComponent(p.deezerPlaylistId)}" target="_blank" rel="noopener">${escapeHtml(p.deezerSync)}</a>`;
+        } else if (p.deezerSync === "failed") {
+            sync = ` • Deezer: failed${p.deezerNote ? " (" + escapeHtml(p.deezerNote) + ")" : ""}`;
+        }
+        return `<div class="report-pl"><strong>${escapeHtml(p.name)}</strong> — ${p.matched} matched, ${p.skipped} skipped${sync}</div>`;
+    }).join("");
+    const skipped = (report.skipped || []).map(s =>
+        `<div class="report-skip"><span class="r-title">${escapeHtml(s.title || "(blank)")}</span> — ${escapeHtml(s.artist || "?")} <em>(${escapeHtml(s.album || "no album")})</em>: ${escapeHtml(s.reason)}</div>`
+    ).join("");
+    body.innerHTML = `
+        <p class="hint">${report.matchedRows}/${report.totalRows} rows strictly matched and imported${report.skippedTruncated ? " (skipped list truncated)" : ""}.</p>
+        ${pls || ""}
+        ${skipped ? `<h4>Skipped — no strict match found</h4>${skipped}` : `<p class="hint">Nothing was skipped.</p>`}
+        <p class="hint">Matched tracks are saved as local playlists (playable right away) and on your Deezer account.</p>
+    `;
+}
+
+document.getElementById("csvImportBtn").onclick = () => document.getElementById("csvFile").click();
+document.getElementById("csvFile").onchange = (e) => {
+    const f = e.target.files[0];
+    if (f) importTuneMyMusicCSV(f);
+    e.target.value = ""; // allow re-importing the same file
 };
 
 // ---------- Queue & History ----------
