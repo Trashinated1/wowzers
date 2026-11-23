@@ -1296,41 +1296,26 @@ type csvRow struct {
 	ISRC     string
 }
 
-// normalizeForMatch reduces a name to its comparable core: lowercase,
-// whitespace collapsed and every character that is not a letter or digit
-// dropped, with diacritics folded. Apostrophes are removed entirely (they sit
-// inside words: "It's" == "Its" == "It s"-free), any other punctuation is a
-// word separator ("AC/DC" == "ac dc"). Comparisons stay STRICT: after
-// normalization the whole word sequence must be identical, so
-// "It's me, It's Verity" == "It's Me, It's Verity" but
-// "keep me going (BIRDBRAIN)" != "keep me going".
+// normalizeForMatch reduces a name to its comparable core: lowercase, with
+// diacritics folded and EVERY character that is not a letter or digit dropped
+// — capitalization, punctuation and whitespace differences can never cause a
+// mismatch ("It's Me, It's Verity" == "its me its verity", "AC/DC" ==
+// "ACDC" == "AC DC", "PT.1" == "PT 1"). Comparisons stay STRICT on content:
+// the full letter/digit sequence must be identical, so
+// "keep me going (BIRDBRAIN)" != "keep me going" and
+// "Constant Companions (Deluxe Edition)" != "Constant Companions".
 func normalizeForMatch(s string) string {
-	s = norm.NFD.String(strings.TrimSpace(s))
+	s = norm.NFD.String(s)
 	var out []rune
-	space := true // leading space suppressed
 	for _, r := range s {
 		if unicode.Is(unicode.Mn, r) { // combining mark (folded accent)
 			continue
 		}
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			out = append(out, unicode.ToLower(r))
-			space = false
-		} else if isApostrophe(r) {
-			// within-word punctuation — dropped, not a separator
-		} else if !space {
-			out = append(out, ' ')
-			space = true
 		}
 	}
-	return strings.TrimSpace(string(out))
-}
-
-func isApostrophe(r rune) bool {
-	switch r {
-	case '\'', '’', 'ʼ', '‘', '`', '´', 'ʻ':
-		return true
-	}
-	return false
+	return string(out)
 }
 
 // artistFeatSplit separates featuring markers ("feat.", "ft.", "featuring")
@@ -1354,7 +1339,9 @@ func splitArtistTokens(s string) []string {
 }
 
 // csvArtistsCredited reports whether EVERY artist named in the CSV row is
-// credited on the Deezer track (main artist or any contributor).
+// credited on the Deezer track (main artist or any contributor). The whole
+// cell is also tried unsplit, so compound names like "Kiss/Drug Kiss" match
+// even when the separator splitting would break them apart.
 func csvArtistsCredited(csvArtist string, dt dzRestTrack) bool {
 	credited := map[string]bool{}
 	add := func(a dzRestArtist) {
@@ -1365,6 +1352,9 @@ func csvArtistsCredited(csvArtist string, dt dzRestTrack) bool {
 	add(dt.Artist)
 	for _, a := range dt.Contributors {
 		add(a)
+	}
+	if normalizeForMatch(csvArtist) != "" && credited[normalizeForMatch(csvArtist)] {
+		return true
 	}
 	tokens := splitArtistTokens(csvArtist)
 	if len(tokens) == 0 {
@@ -1379,10 +1369,14 @@ func csvArtistsCredited(csvArtist string, dt dzRestTrack) bool {
 }
 
 // strictTrackMatch verifies that a Deezer track is EXACTLY the track the CSV
-// row describes: title and album identical after normalization and every CSV
-// artist credited. An empty album cell cannot be verified and is ignored.
+// row describes: title and album identical after normalization (which ignores
+// capitalization, punctuation and whitespace) and every CSV artist credited.
+// An empty album cell cannot be verified and is ignored.
 func strictTrackMatch(row csvRow, dt dzRestTrack) (bool, string) {
-	if normalizeForMatch(row.Title) == "" || normalizeForMatch(row.Title) != normalizeForMatch(dt.Title) {
+	// A truly missing title never matches; a punctuation-only one ("!!!")
+	// still can when the Deezer title normalizes the same way.
+	if strings.TrimSpace(row.Title) == "" ||
+		normalizeForMatch(row.Title) != normalizeForMatch(dt.Title) {
 		return false, "title mismatch"
 	}
 	if !csvArtistsCredited(row.Artist, dt) {
