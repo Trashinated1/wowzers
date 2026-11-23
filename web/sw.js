@@ -1,5 +1,5 @@
-// Bumped cache version to v5: gapless preload, punctuation-insensitive CSV matching
-const CACHE = "wowzers-v5";
+// Bumped cache version to v6: Lists tab shows local playlists only (no Deezer account playlists)
+const CACHE = "wowzers-v6";
 const ASSETS = ["/", "/index.html", "/styles.css", "/app.js", "/manifest.json", "/icon.svg"];
 
 self.addEventListener("install", (e) => {
