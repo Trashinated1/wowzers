@@ -1244,13 +1244,10 @@ type skippedRow struct {
 
 // importedPlaylist groups the import result for one "Playlist name" column.
 type importedPlaylist struct {
-	Name       string  `json:"name"`
-	Matched    int     `json:"matched"`
-	Skipped    int     `json:"skipped"`
-	Tracks     []Track `json:"tracks"`
-	DeezerID   string  `json:"deezerPlaylistId,omitempty"`
-	DeezerSync string  `json:"deezerSync"` // created | updated | failed | skipped
-	DeezerNote string  `json:"deezerNote,omitempty"`
+	Name    string  `json:"name"`
+	Matched int     `json:"matched"`
+	Skipped int     `json:"skipped"`
+	Tracks  []Track `json:"tracks"`
 }
 
 // importReport is the JSON response of POST /api/import/csv.
@@ -1485,13 +1482,10 @@ func (s *Server) matchRow(row csvRow) (dzRestTrack, string) {
 // handleImportCSV implements POST /api/import/csv for TuneMyMusic exports.
 // Every row is resolved to a Deezer track ONLY when title, artist and album
 // names strictly match; unmatched rows are skipped and reported. Matched
-// tracks are written to real Deezer playlists (one per "Playlist name",
-// reusing a playlist of the same name when it exists) unless ?sync=0, and
-// returned as Track objects so the browser can mirror them into local
-// playlists for in-app playback.
+// tracks are returned as Track objects so the browser can mirror them into
+// LOCAL playlists for in-app playback. Nothing is ever written to the
+// Deezer account.
 func (s *Server) handleImportCSV(w http.ResponseWriter, r *http.Request) {
-	syncDeezer := r.URL.Query().Get("sync") != "0"
-
 	var data []byte
 	var err error
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
@@ -1521,13 +1515,13 @@ func (s *Server) handleImportCSV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("csv import: %d rows (deezer sync: %v)", len(rows), syncDeezer)
-	writeJSON(w, s.runImport(rows, syncDeezer))
+	log.Printf("csv import: %d rows (local playlists only)", len(rows))
+	writeJSON(w, s.runImport(rows))
 }
 
-// runImport matches every row, groups the matches per playlist name and —
-// when asked — creates/updates the matching Deezer account playlists.
-func (s *Server) runImport(rows []csvRow, syncDeezer bool) *importReport {
+// runImport matches every row, groups the matches per playlist name and
+// returns them as Track objects for the browser's local playlists.
+func (s *Server) runImport(rows []csvRow) *importReport {
 	report := &importReport{
 		TotalRows: len(rows),
 		Skipped:   []skippedRow{},
@@ -1605,79 +1599,16 @@ func (s *Server) runImport(rows []csvRow, syncDeezer bool) *importReport {
 	sort.Strings(names)
 	for _, name := range names {
 		pl := importedPlaylist{
-			Name:       name,
-			Matched:    len(grouped[name]),
-			Skipped:    skippedByPl[name],
-			Tracks:     grouped[name],
-			DeezerSync: "skipped",
-		}
-		ids := make([]string, 0, len(grouped[name]))
-		for _, t := range grouped[name] {
-			ids = append(ids, t.ID)
-		}
-		if syncDeezer && s.client != nil && len(ids) > 0 {
-			s.syncPlaylistToDeezer(&pl, ids)
+			Name:    name,
+			Matched: len(grouped[name]),
+			Skipped: skippedByPl[name],
+			Tracks:  grouped[name],
 		}
 		report.Playlists = append(report.Playlists, pl)
 	}
 	report.SkippedRows = len(rows) - report.MatchedRows
 	log.Printf("csv import done: %d/%d matched, %d playlist(s)", report.MatchedRows, report.TotalRows, len(report.Playlists))
 	return report
-}
-
-// syncPlaylistToDeezer creates (or reuses) the Deezer playlist and adds every
-// matched track. SDK calls are serialized behind s.mu like the rest of the
-// auth-gated handlers; failures are reported per playlist instead of failing
-// the whole import.
-func (s *Server) syncPlaylistToDeezer(pl *importedPlaylist, ids []string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Reuse an existing Deezer playlist of the same name when there is one.
-	var existingID string
-	if pls, err := s.client.Playlists(); err == nil {
-		for _, p := range pls {
-			if strings.EqualFold(strings.TrimSpace(p.Name), pl.Name) {
-				existingID = p.ID
-				break
-			}
-		}
-	}
-	if existingID != "" {
-		for _, id := range ids {
-			if err := s.client.AddToPlaylist(existingID, id); err != nil {
-				pl.DeezerSync = "failed"
-				pl.DeezerNote = err.Error()
-				return
-			}
-		}
-		pl.DeezerID = existingID
-		pl.DeezerSync = "updated"
-		return
-	}
-
-	// Create the playlist with the first chunk (the gw call embeds every
-	// id in one request) and append the rest in small batches.
-	const chunk = 25
-	first, rest := ids, []string(nil)
-	if len(ids) > chunk {
-		first, rest = ids[:chunk], ids[chunk:]
-	}
-	pid, err := s.client.CreatePlaylist(pl.Name, first)
-	if err != nil {
-		pl.DeezerSync = "failed"
-		pl.DeezerNote = err.Error()
-		return
-	}
-	pl.DeezerID = pid
-	for _, id := range rest {
-		if err := s.client.AddToPlaylist(pid, id); err != nil {
-			pl.DeezerSync = "created"
-			pl.DeezerNote = fmt.Sprintf("created but some tracks could not be added: %v", err)
-			return
-		}
-	}
-	pl.DeezerSync = "created"
 }
 
 // ---------- tagging (MP3 / FLAC) ----------
