@@ -267,7 +267,6 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/search", s.handleSearch)
 	mux.HandleFunc("GET /api/charts", s.handleCharts)
 	mux.HandleFunc("GET /api/favorites", s.handleFavorites)
-	mux.HandleFunc("GET /api/playlists", s.handlePlaylists)
 	mux.HandleFunc("GET /api/playlist/{id}", s.handlePlaylist)
 	mux.HandleFunc("GET /api/artist/{id}", s.handleArtist)
 	mux.HandleFunc("GET /api/album/{id}", s.handleAlbum)
@@ -674,27 +673,6 @@ func (s *Server) handleFavorites(w http.ResponseWriter, r *http.Request) {
 		ts = append(ts, trackFromSDK(t))
 	}
 	writeJSON(w, ts)
-}
-
-func (s *Server) handlePlaylists(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	pl, err := s.client.Playlists()
-	if err != nil {
-		http.Error(w, err.Error(), 502)
-		return
-	}
-	// SDK Playlist fields: Name, TrackCount, ArtworkURL.
-	out := make([]Playlist, 0, len(pl))
-	for _, item := range pl {
-		out = append(out, Playlist{
-			ID:       item.ID,
-			Title:    item.Name,
-			NbTracks: item.TrackCount,
-			Cover:    item.ArtworkURL,
-		})
-	}
-	writeJSON(w, out)
 }
 
 func (s *Server) handlePlaylist(w http.ResponseWriter, r *http.Request) {
