@@ -1,5 +1,5 @@
-// Bumped cache version to v6: Lists tab shows local playlists only (no Deezer account playlists)
-const CACHE = "wowzers-v6";
+// Bumped cache version to v7: CSV import is local-only (no Deezer account writes)
+const CACHE = "wowzers-v7";
 const ASSETS = ["/", "/index.html", "/styles.css", "/app.js", "/manifest.json", "/icon.svg"];
 
 self.addEventListener("install", (e) => {
