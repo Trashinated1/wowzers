@@ -551,6 +551,7 @@ document.getElementById("repeatBtn").onclick = () => {
     if (state.repeat === "off") state.repeat = "all";
     else if (state.repeat === "all") state.repeat = "one";
     else state.repeat = "off";
+    applyRepeatMode();
     updateUI();
 };
 document.getElementById("npShuffleBtn").onclick = () => { state.shuffle = !state.shuffle; updateUI(); };
@@ -558,8 +559,18 @@ document.getElementById("npRepeatBtn").onclick = () => {
     if (state.repeat === "off") state.repeat = "all";
     else if (state.repeat === "all") state.repeat = "one";
     else state.repeat = "off";
+    applyRepeatMode();
     updateUI();
 };
+
+// Repeat-one must survive an unfocused page: iOS blocks the programmatic
+// play() that the "ended" handler relies on once the site loses focus, so the
+// track would just stop. Native media looping (audio.loop) repeats inside the
+// media engine with no JavaScript involved and keeps running in background.
+function applyRepeatMode() {
+    audio.loop = (state.repeat === "one");
+}
+applyRepeatMode();
 
 const volEl = document.getElementById("volume");
 volEl.oninput = () => { state.volume = volEl.value / 100; audio.volume = state.volume; };
